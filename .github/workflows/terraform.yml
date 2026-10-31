@@ -1,0 +1,167 @@
+name: terraform-core-data
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      environments: ${{ steps.meta.outputs.environments }}
+      deploy_prod: ${{ steps.meta.outputs.deploy_prod }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: resolve release metadata
+        id: meta
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+              echo "::error::Tag $GITHUB_REF_NAME points to $GITHUB_SHA, which is not on master"
+              exit 1
+            fi
+            version="$GITHUB_REF_NAME"
+          else
+            version="0.0.0-pr.${PR_NUMBER}"
+          fi
+
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [[ "$version" == *-rc.* ]]; then
+            environments='["dev"]'
+            deploy_prod=false
+          else
+            environments='["dev","prod"]'
+            deploy_prod=true
+          fi
+
+          {
+            echo "version=$version"
+            echo "environments=$environments"
+            echo "deploy_prod=$deploy_prod"
+          } >> "$GITHUB_OUTPUT"
+
+  static-analysis:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.13.0"
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: terraform validate
+        run: |
+          for dir in stacks/core-data bootstrap modules/*; do
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+          done
+
+      - uses: terraform-linters/setup-tflint@v4
+
+      - name: tflint
+        run: |
+          tflint --init --config="$GITHUB_WORKSPACE/.tflint.hcl"
+          tflint --recursive --config="$GITHUB_WORKSPACE/.tflint.hcl"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: trivy config
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      - name: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: terraform
+          quiet: true
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  plan:
+    needs: [release, static-analysis]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJSON(needs.release.outputs.environments) }}
+    environment: ${{ matrix.environment }}-plan
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.13.0"
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/deuna-${{ matrix.environment }}-github-terraform-deployer
+          aws-region: us-east-1
+
+      - name: terraform init
+        run: terraform -chdir=stacks/core-data init -backend-config=../../environments/${{ matrix.environment }}/backend.hcl
+
+      - name: terraform plan
+        env:
+          RELEASE_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          terraform -chdir=stacks/core-data plan \
+            -var-file=../../environments/${{ matrix.environment }}/terraform.tfvars \
+            -var="release_version=${RELEASE_VERSION}" \
+            -out=core-data-${{ matrix.environment }}.tfplan
+          terraform -chdir=stacks/core-data show -json core-data-${{ matrix.environment }}.tfplan > core-data-${{ matrix.environment }}.plan.json
+
+      - name: checkov on plan
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          file: core-data-${{ matrix.environment }}.plan.json
+          framework: terraform_plan
+          quiet: true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-data-${{ matrix.environment }}-tfplan
+          path: stacks/core-data/core-data-${{ matrix.environment }}.tfplan
+          retention-days: 5
+
+  apply-dev:
+    if: github.ref_type == 'tag'
+    needs: [release, plan]
+    uses: ./.github/workflows/terraform-apply.yml
+    with:
+      environment: dev
+
+  apply-prod:
+    if: github.ref_type == 'tag' && needs.release.outputs.deploy_prod == 'true'
+    needs: [release, apply-dev]
+    uses: ./.github/workflows/terraform-apply.yml
+    with:
+      environment: prod
