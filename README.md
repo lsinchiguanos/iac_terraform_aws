@@ -18,27 +18,71 @@ Provisiona en AWS la llave KMS, el bucket de registros transaccionales, el clús
 
 ```
 .
-├── bootstrap/                          bucket + llave KMS del estado remoto, uno por cuenta
+├── .github/workflows/
+│   ├── terraform.yml                   PR: análisis estático + plan dev/prod · tag X.Y.Z: plan + apply dev → prod
+│   └── terraform-apply.yml             workflow reutilizable: apply del .tfplan aprobado por ambiente
+├── bootstrap/                          estado remoto de una cuenta (se aplica una vez por cuenta)
+│   ├── backend.tf                      backend "s3" parcial; primer apply con backend_override.tf local
+│   ├── main.tf                         módulos kms-key (deuna-<env>-terraform-state) y s3-bucket (deuna-<env>-terraform-state-<cuenta>)
+│   ├── outputs.tf · providers.tf · variables.tf · versions.tf
+│   └── .terraform.lock.hcl
 ├── modules/
-│   ├── kms-key/                        llave simétrica, key policy por roles, alias
-│   ├── s3-bucket/                      bucket SSE-KMS, versionado, lifecycle, object lock, bucket policy
-│   ├── aurora-postgresql/              subnet group, SG, parameter group, clúster, instancias, log group, rol de Enhanced Monitoring
+│   ├── kms-key/                        aws_kms_key, aws_kms_alias, key policy por roles
+│   ├── s3-bucket/                      bucket, ownership, public access block, versionado, SSE-KMS, object lock, lifecycle, bucket policy
+│   ├── aurora-postgresql/              subnet group, SG + ingress, parameter group, log group, rol de Enhanced Monitoring, clúster, instancias
 │   ├── secretsmanager-secret/          secreto, versión write-only, resource policy, rotación
-│   └── rds-postgresql-rotation-lambda/ Lambda de rotación (SAR), SG, VPC endpoint de Secrets Manager, log group
+│   └── rds-postgresql-rotation-lambda/ stack SAR de rotación, SG + reglas, VPC endpoint de Secrets Manager, log group
+│       └── (cada módulo) main.tf · variables.tf · outputs.tf · versions.tf
 ├── stacks/
-│   └── core-data/                      composición raíz: une los 5 módulos y resuelve VPC, subnets, SGs y roles existentes
+│   └── core-data/                      root module de la Tarea 3: llave, bucket, Aurora y secreto pgadmin
+│       ├── versions.tf                 Terraform >= 1.11, aws ~> 6.0, random ~> 3.7, backend "s3" parcial
+│       ├── providers.tf                provider aws con allowed_account_ids
+│       ├── data.tf                     VPC, subnets private-data, SG de ECS y roles IAM existentes
+│       ├── locals.tf                   nombres deuna-<env>-*, tags comunes, ARNs de roles
+│       ├── main.tf                     password ephemeral + llamadas a los 5 módulos
+│       ├── variables.tf · outputs.tf
+│       └── .terraform.lock.hcl
 ├── environments/
-│   ├── dev/   backend.hcl · bootstrap.tfvars · terraform.tfvars
-│   └── prod/  backend.hcl · bootstrap.tfvars · terraform.tfvars
-├── .github/workflows/terraform.yml
+│   ├── dev/
+│   │   ├── backend.hcl                 bucket, key core-data/terraform.tfstate, llave KMS, use_lockfile
+│   │   ├── bootstrap.tfvars            entradas de bootstrap/
+│   │   └── terraform.tfvars            entradas de stacks/core-data/ (Serverless v2, retenciones cortas)
+│   └── prod/
+│       ├── backend.hcl
+│       ├── bootstrap.tfvars
+│       └── terraform.tfvars            2 × db.r7g.large, backups 35 d, object lock 365 d
 ├── .tflint.hcl
-└── .pre-commit-config.yaml
+├── .pre-commit-config.yaml
+├── .gitignore
+└── README.md
 ```
 
-- **`modules/`** no tiene `provider` ni `backend`; recibe todo por variables y valida que `tags` traiga `Environment`, `Project` y `Owner`. `bootstrap/` reutiliza `kms-key` y `s3-bucket` para el estado, así el bucket de estado tiene los mismos controles que el de datos.
-- **`stacks/core-data/`** es una única composición para ambos ambientes. La diferencia entre `dev` y `prod` vive solo en `environments/<env>/terraform.tfvars`; el código que se prueba en `dev` es exactamente el que llega a `prod`.
-- **`environments/<env>/`** no contiene `.tf`. Cada ambiente es una cuenta AWS distinta; `allowed_account_ids` en el provider hace fallar el plan si se combina el `backend.hcl` o el `.tfvars` de un ambiente con credenciales de otra cuenta.
-- La rotación está en un módulo propio porque su ciclo de vida (versión de la app SAR, VPC endpoint) cambia independiente del secreto, y porque su rol IAM debe existir antes de escribir la key policy.
+### Justificación
+
+La estructura separa tres cosas que cambian a ritmos distintos y con riesgos distintos: **cómo se construye un recurso** (`modules/`), **qué se despliega junto** (`stacks/`) y **con qué valores en cada cuenta** (`environments/`). `bootstrap/` queda aparte porque crea el bucket donde viven los demás estados.
+
+| Carpeta | Decisión | Motivo |
+|---|---|---|
+| `modules/` | Un módulo por recurso de la Tarea 3, más `rds-postgresql-rotation-lambda` | Cada módulo encapsula los controles obligatorios de su recurso (SSE-KMS, bucket policy, `storage_encrypted`, `block_public_policy`); quien lo instancia no puede omitirlos porque no son variables. `bootstrap/` reutiliza `kms-key` y `s3-bucket`, así el bucket de estado tiene los mismos controles que el de datos. |
+| `modules/` | Sin bloques `provider` ni `backend`; `versions.tf` con rango `>= 6.0.0, < 7.0.0` | El root module decide cuenta, región y versión exacta del provider; el módulo solo declara compatibilidad. |
+| `modules/` | `validation` en `tags` que exige `Environment`, `Project`, `Owner` y `Version` | El etiquetado de costos y de release no depende de que cada stack lo recuerde. |
+| `modules/rds-postgresql-rotation-lambda/` | Separado de `secretsmanager-secret/` | El rol IAM de la Lambda tiene que existir antes de escribir la key policy de KMS, y el secreto necesita esa llave; en un mismo módulo se forma un ciclo. Además su ciclo de vida es distinto: versión de la app SAR y VPC endpoint. |
+| `stacks/core-data/` | Un root module para los cuatro recursos, con un state propio (`core-data/terraform.tfstate`) | Llave, bucket, clúster y secreto dependen entre sí (la key policy referencia al rol de rotación, el secreto referencia al endpoint de Aurora) y se despliegan juntos. Un stack futuro, p. ej. `stacks/ecs-observability/` para la Tarea 1, tendría su propio state y un `plan` que no puede tocar Aurora. |
+| `stacks/core-data/` | Archivos por responsabilidad (`data.tf`, `locals.tf`, `main.tf`) | En revisión de PR, un cambio en `data.tf` indica dependencia nueva sobre infraestructura existente y uno en `main.tf` indica recurso nuevo o modificado. |
+| `environments/<env>/` | Solo `.hcl` y `.tfvars`, sin `.tf` | El mismo código pasa de `dev` a `prod`; la única diferencia entre ambientes es lo que se ve en un diff de `terraform.tfvars`. `allowed_account_ids` hace fallar el plan si se usa el `.tfvars` de un ambiente con credenciales de la otra cuenta. |
+| `environments/<env>/backend.hcl` | Configuración parcial de backend fuera del código | Cada cuenta tiene su bucket y su llave KMS de estado; el mismo `versions.tf` sirve para ambas cuentas con `terraform init -backend-config`. |
+| `bootstrap/` | Root module independiente con su propio state (`bootstrap/terraform.tfstate`) | Resuelve el problema de dónde guardar el estado del bucket de estado: primer apply local con `backend_override.tf` y migración al bucket recién creado. Se aplica una vez por cuenta, no en cada release. |
+| `.terraform.lock.hcl` | Versionado en `stacks/core-data/` y `bootstrap/`, no en `modules/` | Los hashes del provider se fijan donde se ejecuta `apply`; CI y la máquina local usan exactamente `aws 6.71.0` y `random 3.9.1`. |
+| `.github/workflows/terraform-apply.yml` | `apply` como workflow reutilizable | `dev` y `prod` ejecutan los mismos pasos; solo cambian el GitHub Environment (aprobadores, `AWS_ACCOUNT_ID`) y el `.tfplan`. |
+
+Alternativas descartadas:
+
+| Alternativa | Por qué no |
+|---|---|
+| Una carpeta `.tf` completa por ambiente (`environments/prod/main.tf`) | Duplica las llamadas a módulos; un cambio aplicado en `dev` puede no replicarse en `prod` y el diff entre ambientes deja de ser solo de valores. |
+| Terraform workspaces (`terraform workspace select prod`) | Todos los workspaces comparten backend, es decir, el mismo bucket y la misma cuenta; aquí `dev` y `prod` son cuentas AWS separadas con buckets y llaves de estado distintos. |
+| Terragrunt | Resuelve la duplicación de backend con una herramienta y una sintaxis adicionales; con un solo stack y dos ambientes, `-backend-config` y `-var-file` cubren el caso sin otra dependencia en el pipeline. Se reevalúa cuando haya más de 3 stacks × 3 ambientes. |
+| Un solo root module con todos los recursos de la plataforma | El state crece con cada servicio, el `plan` se vuelve lento y un error en un recurso de ECS bloquea un cambio urgente en Aurora. |
 
 ## Decisiones por recurso
 
